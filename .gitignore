@@ -7,3 +7,5 @@ build/
 .colab_mcp_jobs/
 .pytest_cache/
 .env
+.venv/
+venv/

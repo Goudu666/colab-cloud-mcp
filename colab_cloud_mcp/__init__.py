@@ -4,6 +4,6 @@ __version__ = "0.1.0"
 
 from .runtime import ColabRuntime
 from .server import create_app
-from .tunnel import start_colab_mcp
+from .tunnel import ActiveColabMCP, start_colab_mcp
 
-__all__ = ["ColabRuntime", "create_app", "start_colab_mcp", "__version__"]
+__all__ = ["ActiveColabMCP", "ColabRuntime", "create_app", "start_colab_mcp", "__version__"]

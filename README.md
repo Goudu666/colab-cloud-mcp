@@ -1,5 +1,7 @@
 # colab-cloud-mcp
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Goudu666/colab-cloud-mcp/blob/main/notebooks/colab_cloud_mcp.ipynb)
+
 让 **Claude 云端对话（网页 / 手机 App / Desktop Custom Connectors）**、**Google Antigravity** 以及 **Claude Code** 通过公网 HTTPS (443) **Streamable HTTP** 协议直接连接 Google Colab GPU 运行时的远程 MCP Server。
 
 ## 为什么需要这个项目？
@@ -9,17 +11,19 @@
 `colab-cloud-mcp` 将 MCP 服务端**直接运行在 Google Colab 虚拟机内部**，并通过 HTTPS 隧道（Cloudflare Tunnel 或 ngrok）暴露符合最新规范的 `Streamable HTTP` 端点：
 
 - **真正脱离本机**：云端对话客户端直接访问 Colab 端服务，本机合盖、断网或切换到手机端对话均不断连。
+- **SSE 心跳防断流**：`POST /mcp` 的 `tools/call` 请求自动采用 SSE 流式心跳保活，防止超过 100 秒时触发 Cloudflare Tunnel HTTP 524 超时。
 - **持久化 Python 命名空间 + 自动捕获图表**：`execute_python` 跨轮次保留所有变量、PyTorch 模型与显存张量；Matplotlib 绘图自动转为 PNG 图像块回传给对话界面。
-- **异步后台长任务管理**：针对云端单次工具调用超时限制（Claude 240s / Antigravity 默认 180s），内置 `start_background_job` / `get_job_status` / `cancel_job`，支持数小时模型训练或大权重下载至 Google Drive，随时在对话中拉取最新日志。
+- **异步后台长任务与重启持久化**：内置 `start_background_job` / `get_job_status` / `cancel_job`，支持数小时模型训练或大权重下载至 Google Drive；任务元数据与日志落盘持久化，服务端重启后仍可继续追踪与查询日志。
+- **安全重跑与优雅停止**：同一端口重复运行启动单元格会自动停止旧服务与隧道，避免端口占用与旧 Token `401` 冲突；也可随时调用 `mcp_server.stop()` 手动关闭服务与隧道。
 - **会话导出为 `.ipynb`**：随时调用 `export_session_notebook` 将执行过的所有代码与输出图像保存为标准 Jupyter Notebook。
 - **三重鉴权兼容所有客户端**：
   1. **零请求头加密路径模式**（`<TUNNEL_URL>/s/<MCP_TOKEN>/mcp`）：适配 Claude Custom Connectors 的 `No sign in` 模式，粘贴单条 URL 即可安全鉴权。
   2. **标准 Bearer Header 模式**（`Authorization: Bearer <MCP_TOKEN>`）：适配 Google Antigravity `mcp_config.json`、Claude Code HTTP MCP 与 Claude Request Headers。
-  3. **内置 OAuth 2.1 (PKCE + DCR + CIMD)**：完整实现 `/.well-known/oauth-protected-resource`、`/.well-known/oauth-authorization-server`、动态客户端注册与 PKCE 授权码流程。
+  3. **内置 OAuth 2.1 (PKCE + DCR)**：完整实现 `/.well-known/oauth-protected-resource`、`/.well-known/oauth-authorization-server`、动态客户端注册与 PKCE 授权码流程。
 
 ## 快速开始（在 Google Colab 中运行）
 
-打开本仓库的 `notebooks/colab_cloud_mcp.ipynb` 按顺序执行即可启动服务并打印所有客户端接入配置。
+点击顶部 **Open in Colab** 徽章，或打开本仓库的 `notebooks/colab_cloud_mcp.ipynb` 按顺序执行即可启动服务并打印所有客户端接入配置。重复运行 Step 3 单元格会自动清理旧实例并无缝重启；如需手动释放端口与隧道，可运行 `mcp_server.stop()`。
 
 合盖前在最后一个单元格运行保活监控：
 
@@ -55,11 +59,10 @@ mcp_server.keep_alive(status_interval_seconds=60)
 {
   "mcpServers": {
     "colab-remote": {
-      "serverUrl": "<TUNNEL_URL>/mcp",
+      "url": "<TUNNEL_URL>/mcp",
       "headers": {
         "Authorization": "Bearer <MCP_TOKEN>"
-      },
-      "timeoutSeconds": 600
+      }
     }
   }
 }
@@ -68,7 +71,7 @@ mcp_server.keep_alive(status_interval_seconds=60)
 ### 3. Claude Code CLI
 
 ```bash
-claude mcp add --transport http colab-remote <TUNNEL_URL>/mcp \
+claude mcp add -s user --transport http colab-remote <TUNNEL_URL>/mcp \
   --header "Authorization: Bearer <MCP_TOKEN>"
 ```
 
@@ -78,12 +81,14 @@ claude mcp add --transport http colab-remote <TUNNEL_URL>/mcp \
 | :--- | :--- |
 | `get_runtime_status` | 查看 GPU 型号与显存 (`nvidia-smi`)、CPU/内存/磁盘、PyTorch CUDA 状态、Google Drive 挂载情况与后台任务数 |
 | `execute_python` | 在持久化命名空间执行 Python 代码，自动捕获 `stdout`/`stderr`、返回值及 Matplotlib PNG 图像 |
-| `reset_python_namespace` | 清空持久化变量并触发 `gc.collect()` 与 `torch.cuda.empty_cache()` 释放显存 |
+| `reset_python_namespace` | 清空持久化变量并触发 `gc.collect()` 与 `torch.cuda.empty_cache()` 释放显存（可选清空会话历史） |
 | `run_shell` | 执行 Bash 命令（支持工作目录与超时进程组清理） |
 | `install_packages` | 通过 `pip` 安装或升级 Python 依赖包 |
-| `start_background_job` | 异步启动长时间后台训练或大权重下载任务，日志实时落盘 |
+| `start_background_job` | 异步启动长时间后台训练或大权重下载任务，日志与元数据实时落盘持久化 |
 | `get_job_status` / `list_jobs` / `cancel_job` | 查询后台任务状态与末尾日志、列出或终止后台任务 |
 | `list_files` / `read_file` / `write_file` | 浏览、按行读取或写入 Colab 工作区与 Google Drive 文件 |
+| `edit_file` | 对已有文本文件进行精确局部查找与替换（支持单次匹配或全量替换） |
+| `read_image` | 读取工作区或 Google Drive 中的图片文件并以图像内容块直接回传对话界面 |
 | `export_session_notebook` | 将当前会话执行过的所有代码与图表导出为 `.ipynb` 文件 |
 
 ## 本地测试

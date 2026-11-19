@@ -15,6 +15,8 @@ import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from starlette.applications import Starlette
+from starlette.datastructures import MutableHeaders
+from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
@@ -29,6 +31,18 @@ SUPPORTED_PROTOCOL_VERSIONS = [
     "2024-11-05",
 ]
 DEFAULT_PROTOCOL_VERSION = "2025-06-18"
+MAX_OAUTH_CLIENTS = 256
+MAX_OAUTH_AUTH_CODES = 256
+MAX_SESSIONS = 512
+
+CORS_HEADERS: Dict[str, str] = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+    "Access-Control-Allow-Headers": (
+        "Authorization, Content-Type, Accept, Mcp-Session-Id, MCP-Protocol-Version, X-Api-Key"
+    ),
+    "Access-Control-Expose-Headers": "Mcp-Session-Id",
+}
 
 SERVER_INSTRUCTIONS = (
     "Connected directly to a remote Google Colab VM via colab-cloud-mcp. "
@@ -39,12 +53,167 @@ SERVER_INSTRUCTIONS = (
 )
 
 
+def _consteq(a: str, b: str) -> bool:
+    return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+
+
 def _get_external_base_url(request: Request, configured_public_url: Optional[str] = None) -> str:
     if configured_public_url:
         return configured_public_url.rstrip("/")
     proto = request.headers.get("x-forwarded-proto") or request.url.scheme or "https"
     host = request.headers.get("x-forwarded-host") or request.headers.get("host") or "localhost"
     return f"{proto}://{host}".rstrip("/")
+
+
+def _is_valid_redirect_uri(uri: Any) -> bool:
+    if not isinstance(uri, str) or not uri or any(ch.isspace() for ch in uri):
+        return False
+    if "#" in uri:
+        return False
+    parsed = urllib.parse.urlsplit(uri)
+    if parsed.fragment:
+        return False
+    try:
+        _ = parsed.port
+    except ValueError:
+        return False
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return False
+    if scheme == "https":
+        return True
+    if scheme == "http" and host in ("localhost", "127.0.0.1", "::1"):
+        return True
+    return False
+
+
+async def _parse_urlencoded_form(request: Request) -> Dict[str, str]:
+    raw_body = await request.body()
+    parsed = urllib.parse.parse_qs(
+        raw_body.decode("utf-8", errors="replace"),
+        keep_blank_values=True,
+    )
+    return {k: v[0] if v else "" for k, v in parsed.items()}
+
+
+def _contains_tool_call(payload: Any) -> bool:
+    if isinstance(payload, dict):
+        return payload.get("method") == "tools/call" and "id" in payload
+    if isinstance(payload, list):
+        return any(
+            isinstance(item, dict) and item.get("method") == "tools/call" and "id" in item
+            for item in payload
+        )
+    return False
+
+
+def _is_initialize_payload(payload: Any) -> bool:
+    if isinstance(payload, dict):
+        return payload.get("method") == "initialize"
+    if isinstance(payload, list):
+        return any(isinstance(item, dict) and item.get("method") == "initialize" for item in payload)
+    return False
+
+
+class _CORSMiddleware:
+    """Adds CORS headers to all HTTP responses and handles OPTIONS preflight requests."""
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        if scope["method"] == "OPTIONS":
+            response = Response(
+                status_code=200,
+                headers={**CORS_HEADERS, "Access-Control-Max-Age": "600"},
+            )
+            await response(scope, receive, send)
+            return
+
+        async def _send_with_cors(message: Any) -> None:
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                for key, value in CORS_HEADERS.items():
+                    headers.setdefault(key, value)
+            await send(message)
+
+        await self.app(scope, receive, _send_with_cors)
+
+
+def _render_authorize_error(message: str) -> HTMLResponse:
+    page = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Authorization Error - Colab Cloud MCP</title>
+  <style>
+    body {{ font-family: system-ui, -apple-system, sans-serif; background: #0f172a; color: #f8fafc; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 16px; }}
+    .card {{ background: #1e293b; border: 1px solid #334155; border-radius: 12px; max-width: 420px; width: 100%; padding: 24px; box-shadow: 0 10px 30px rgba(0,0,0,0.4); }}
+    h1 {{ font-size: 1.25rem; margin: 0 0 8px; color: #fca5a5; }}
+    p {{ color: #cbd5e1; font-size: 0.9rem; line-height: 1.5; margin: 0; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Invalid Authorization Request</h1>
+    <p>{html.escape(message)}</p>
+  </div>
+</body>
+</html>"""
+    return HTMLResponse(page, status_code=400)
+
+
+def _render_authorize_form(
+    client_id: str,
+    redirect_uri: str,
+    state: str,
+    code_challenge: str,
+    code_challenge_method: str,
+    error_message: Optional[str] = None,
+) -> str:
+    error_banner = (
+        f'<div class="error">{html.escape(error_message)}</div>'
+        if error_message
+        else ""
+    )
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Authorize Colab Cloud MCP</title>
+  <style>
+    body {{ font-family: system-ui, -apple-system, sans-serif; background: #0f172a; color: #f8fafc; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 16px; }}
+    .card {{ background: #1e293b; border: 1px solid #334155; border-radius: 12px; max-width: 420px; width: 100%; padding: 24px; box-shadow: 0 10px 30px rgba(0,0,0,0.4); }}
+    h1 {{ font-size: 1.25rem; margin: 0 0 8px; }}
+    p {{ color: #94a3b8; font-size: 0.9rem; line-height: 1.5; margin: 0 0 16px; }}
+    .error {{ background: #7f1d1d; border: 1px solid #ef4444; color: #fecaca; border-radius: 8px; padding: 10px 12px; font-size: 0.875rem; margin-bottom: 16px; }}
+    input[type="password"] {{ width: 100%; box-sizing: border-box; padding: 10px 12px; border-radius: 8px; border: 1px solid #475569; background: #0f172a; color: #f8fafc; margin-bottom: 16px; font-family: monospace; }}
+    button {{ width: 100%; padding: 10px 16px; border: none; border-radius: 8px; background: #3b82f6; color: white; font-weight: 600; cursor: pointer; }}
+    button:hover {{ background: #2563eb; }}
+  </style>
+</head>
+<body>
+  <form class="card" method="post" action="/oauth/authorize">
+    <h1>Connect to Google Colab</h1>
+    <p>Enter the <code>MCP_TOKEN</code> printed in your Colab notebook to grant MCP access.</p>
+    {error_banner}
+    <input type="hidden" name="client_id" value="{html.escape(client_id, quote=True)}" />
+    <input type="hidden" name="redirect_uri" value="{html.escape(redirect_uri, quote=True)}" />
+    <input type="hidden" name="state" value="{html.escape(state, quote=True)}" />
+    <input type="hidden" name="code_challenge" value="{html.escape(code_challenge, quote=True)}" />
+    <input type="hidden" name="code_challenge_method" value="{html.escape(code_challenge_method, quote=True)}" />
+    <input type="password" name="mcp_token" placeholder="Paste MCP_TOKEN..." required autofocus />
+    <button type="submit">Authorize Connection</button>
+  </form>
+</body>
+</html>"""
 
 
 def build_tool_definitions() -> List[Dict[str, Any]]:
@@ -84,7 +253,17 @@ def build_tool_definitions() -> List[Dict[str, Any]]:
         {
             "name": "reset_python_namespace",
             "description": "Clear persistent Python variables and trigger garbage collection + CUDA VRAM cache cleanup.",
-            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "clear_history": {
+                        "type": "boolean",
+                        "description": "Also clear recorded cell execution history used for notebook export (default False).",
+                        "default": False,
+                    }
+                },
+                "additionalProperties": False,
+            },
         },
         {
             "name": "run_shell",
@@ -122,6 +301,11 @@ def build_tool_definitions() -> List[Dict[str, Any]]:
                         "type": "boolean",
                         "description": "Pass -U to upgrade packages.",
                         "default": False,
+                    },
+                    "timeout_seconds": {
+                        "type": "integer",
+                        "description": "Timeout in seconds for pip install (default 210).",
+                        "default": 210,
                     },
                 },
                 "required": ["packages"],
@@ -256,6 +440,44 @@ def build_tool_definitions() -> List[Dict[str, Any]]:
             },
         },
         {
+            "name": "edit_file",
+            "description": "Replace exact text in a UTF-8 file in the Colab VM or Google Drive.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to file to edit."},
+                    "old_text": {
+                        "type": "string",
+                        "description": "Exact text substring to find and replace.",
+                    },
+                    "new_text": {"type": "string", "description": "Replacement text."},
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "Replace all occurrences instead of requiring a single unique match (default False).",
+                        "default": False,
+                    },
+                },
+                "required": ["path", "old_text", "new_text"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "read_image",
+            "description": (
+                "Read an image file (PNG, JPEG, WebP, GIF) from the Colab VM or Google Drive "
+                "and return it as an MCP image content block."
+            ),
+            "annotations": {"readOnlyHint": True},
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to image file."},
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+        {
             "name": "export_session_notebook",
             "description": "Save all executed `execute_python` cells and captured outputs/plots into a Jupyter .ipynb file.",
             "inputSchema": {
@@ -289,10 +511,10 @@ class OAuthState:
         sig = hmac.new(self._signing_key, payload.encode("ascii"), hashlib.sha256).hexdigest()
         return f"cmcp_{payload}.{sig}"
 
-    def verify_token(self, candidate: str) -> bool:
+    def verify_token(self, candidate: str, expected_kind: str = "access") -> bool:
         if not candidate:
             return False
-        if hmac.compare_digest(candidate, self.master_token):
+        if expected_kind == "access" and _consteq(candidate, self.master_token):
             return True
         if not candidate.startswith("cmcp_"):
             return False
@@ -301,11 +523,16 @@ class OAuthState:
         if len(parts) != 2:
             return False
         payload, sig = parts
-        expected = hmac.new(self._signing_key, payload.encode("ascii"), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(sig, expected):
+        try:
+            expected = hmac.new(
+                self._signing_key, payload.encode("ascii"), hashlib.sha256
+            ).hexdigest()
+        except UnicodeEncodeError:
+            return False
+        if not _consteq(sig, expected):
             return False
         fields = payload.split(".")
-        if len(fields) != 3 or fields[0] != "access":
+        if len(fields) != 3 or fields[0] != expected_kind:
             return False
         try:
             return int(fields[1]) >= int(time.time())
@@ -323,7 +550,12 @@ class MCPProtocolEngine:
 
     def ensure_session(self, existing_id: Optional[str] = None) -> str:
         sid = existing_id or uuid.uuid4().hex
+        if sid in self.sessions:
+            del self.sessions[sid]
         self.sessions[sid] = time.time()
+        while len(self.sessions) > MAX_SESSIONS:
+            oldest = next(iter(self.sessions))
+            del self.sessions[oldest]
         return sid
 
     async def dispatch_tool(
@@ -349,8 +581,14 @@ class MCPProtocolEngine:
                 return blocks, payload.get("status") != "ok"
 
             if name == "reset_python_namespace":
-                res = await loop.run_in_executor(None, self.runtime.reset_python_namespace)
-                return [{"type": "text", "text": json.dumps(res, ensure_ascii=False, indent=2)}], False
+                clear_history = bool(arguments.get("clear_history", False))
+                res = await loop.run_in_executor(
+                    None, self.runtime.reset_python_namespace, clear_history
+                )
+                return (
+                    [{"type": "text", "text": json.dumps(res, ensure_ascii=False, indent=2)}],
+                    res.get("status") != "ok",
+                )
 
             if name == "run_shell":
                 cmd = str(arguments.get("command", ""))
@@ -367,8 +605,9 @@ class MCPProtocolEngine:
             if name == "install_packages":
                 pkgs = list(arguments.get("packages") or [])
                 upgrade = bool(arguments.get("upgrade", False))
+                timeout_s = int(arguments.get("timeout_seconds", 210))
                 res = await loop.run_in_executor(
-                    None, self.runtime.install_packages, pkgs, upgrade
+                    None, self.runtime.install_packages, pkgs, upgrade, timeout_s
                 )
                 return (
                     [{"type": "text", "text": json.dumps(res, ensure_ascii=False, indent=2)}],
@@ -438,27 +677,91 @@ class MCPProtocolEngine:
                 res = await loop.run_in_executor(
                     None, self.runtime.write_file, path, content, append
                 )
-                return [{"type": "text", "text": json.dumps(res, ensure_ascii=False, indent=2)}], False
+                return (
+                    [{"type": "text", "text": json.dumps(res, ensure_ascii=False, indent=2)}],
+                    res.get("status") != "ok",
+                )
+
+            if name == "edit_file":
+                path = str(arguments.get("path", ""))
+                old_text = str(arguments.get("old_text", ""))
+                new_text = str(arguments.get("new_text", ""))
+                replace_all = bool(arguments.get("replace_all", False))
+                res = await loop.run_in_executor(
+                    None, self.runtime.edit_file, path, old_text, new_text, replace_all
+                )
+                return (
+                    [{"type": "text", "text": json.dumps(res, ensure_ascii=False, indent=2)}],
+                    res.get("status") != "ok",
+                )
+
+            if name == "read_image":
+                path = str(arguments.get("path", ""))
+                res = await loop.run_in_executor(None, self.runtime.read_image, path)
+                if res.get("status") == "ok":
+                    meta = dict(res)
+                    b64 = meta.pop("data_base64")
+                    mime_type = meta["mime_type"]
+                    return (
+                        [
+                            {"type": "text", "text": json.dumps(meta, ensure_ascii=False, indent=2)},
+                            {"type": "image", "data": b64, "mimeType": mime_type},
+                        ],
+                        False,
+                    )
+                return (
+                    [{"type": "text", "text": json.dumps(res, ensure_ascii=False, indent=2)}],
+                    True,
+                )
 
             if name == "export_session_notebook":
                 out_path = str(arguments.get("output_path", "mcp_session_export.ipynb"))
                 res = await loop.run_in_executor(
                     None, self.runtime.export_session_notebook, out_path
                 )
-                return [{"type": "text", "text": json.dumps(res, ensure_ascii=False, indent=2)}], False
+                return (
+                    [{"type": "text", "text": json.dumps(res, ensure_ascii=False, indent=2)}],
+                    res.get("status") != "ok",
+                )
 
             return [{"type": "text", "text": f"Unknown tool: {name}"}], True
         except Exception as exc:
             return [{"type": "text", "text": f"Tool execution error: {exc}"}], True
 
     async def handle_rpc_message(self, msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Processes a single JSON-RPC 2.0 message; returns None for notifications."""
-        msg_id = msg.get("id")
-        method = msg.get("method", "")
-        params = msg.get("params") or {}
+        """Processes a single JSON-RPC 2.0 message; returns None for notifications and responses."""
+        if "method" not in msg:
+            if "result" in msg or "error" in msg:
+                return None
+            return {
+                "jsonrpc": "2.0",
+                "id": msg.get("id"),
+                "error": {"code": -32600, "message": "Invalid Request: missing method"},
+            }
 
         if "id" not in msg:
             return None
+
+        msg_id = msg.get("id")
+        method = msg.get("method")
+        if not isinstance(method, str) or not method:
+            return {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "error": {"code": -32600, "message": "Invalid Request: method must be a string"},
+            }
+
+        raw_params = msg.get("params")
+        if raw_params is None:
+            params: Dict[str, Any] = {}
+        elif isinstance(raw_params, dict):
+            params = raw_params
+        else:
+            return {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "error": {"code": -32602, "message": "Invalid params: expected object"},
+            }
 
         if method == "initialize":
             requested_ver = str(params.get("protocolVersion", DEFAULT_PROTOCOL_VERSION))
@@ -492,13 +795,21 @@ class MCPProtocolEngine:
 
         if method == "tools/call":
             tool_name = params.get("name")
-            if not tool_name:
+            if not tool_name or not isinstance(tool_name, str):
                 return {
                     "jsonrpc": "2.0",
                     "id": msg_id,
                     "error": {"code": -32602, "message": "Missing tool name"},
                 }
-            tool_args = params.get("arguments") or {}
+            tool_args = params.get("arguments")
+            if tool_args is None:
+                tool_args = {}
+            elif not isinstance(tool_args, dict):
+                return {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "error": {"code": -32602, "message": "Invalid tool arguments: expected object"},
+                }
             content_blocks, is_error = await self.dispatch_tool(tool_name, tool_args)
             return {
                 "jsonrpc": "2.0",
@@ -560,6 +871,7 @@ def create_app(
     token: str,
     runtime: Optional[ColabRuntime] = None,
     public_url: Optional[str] = None,
+    instance_id: Optional[str] = None,
 ) -> Starlette:
     """Creates the Starlette ASGI app exposing Streamable HTTP, SSE, Secret-Path, and OAuth 2.1."""
     if not token:
@@ -572,29 +884,51 @@ def create_app(
 
     def _is_authorized(request: Request) -> bool:
         path_tok = request.path_params.get("path_token")
-        if path_tok and hmac.compare_digest(path_tok, token):
+        if path_tok and _consteq(path_tok, token):
             return True
 
         auth_header = request.headers.get("authorization", "")
         if auth_header.lower().startswith("bearer "):
             candidate = auth_header[7:].strip()
-            if oauth.verify_token(candidate):
+            if oauth.verify_token(candidate, expected_kind="access"):
                 return True
 
         api_key = request.headers.get("x-api-key", "").strip()
-        if api_key and oauth.verify_token(api_key):
+        if api_key and oauth.verify_token(api_key, expected_kind="access"):
             return True
 
         return False
 
     def _unauthorized_response(request: Request) -> JSONResponse:
-        base = _get_external_base_url(request, public_url)
+        base = _get_external_base_url(request, app.state.public_url)
         www_auth = f'Bearer resource_metadata="{base}/.well-known/oauth-protected-resource"'
         return JSONResponse(
-            {"error": "unauthorized", "message": "Valid Bearer token, OAuth token, or secret URL path required."},
+            {
+                "error": "unauthorized",
+                "message": "Valid Bearer token, OAuth token, or secret URL path required.",
+            },
             status_code=401,
             headers={"WWW-Authenticate": www_auth},
         )
+
+    async def _execute_rpc_payload(payload: Any) -> Any:
+        if isinstance(payload, dict):
+            return await engine.handle_rpc_message(payload)
+        responses: List[Dict[str, Any]] = []
+        for item in payload:
+            if isinstance(item, dict):
+                resp = await engine.handle_rpc_message(item)
+                if resp is not None:
+                    responses.append(resp)
+            else:
+                responses.append(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": None,
+                        "error": {"code": -32600, "message": "Invalid Request"},
+                    }
+                )
+        return responses
 
     async def health_endpoint(request: Request) -> JSONResponse:
         return JSONResponse(
@@ -602,6 +936,7 @@ def create_app(
                 "status": "ok",
                 "service": "colab-cloud-mcp",
                 "version": __version__,
+                "instance_id": app.state.instance_id,
                 "transports": ["streamable-http", "sse"],
             }
         )
@@ -611,18 +946,18 @@ def create_app(
             return _unauthorized_response(request)
 
         incoming_sid = request.headers.get("mcp-session-id")
-        session_id = engine.ensure_session(incoming_sid)
-        base_headers = {
-            "Mcp-Session-Id": session_id,
-            "Cache-Control": "no-cache",
-        }
+        base_headers: Dict[str, str] = {"Cache-Control": "no-cache"}
 
         if request.method == "DELETE":
-            engine.sessions.pop(session_id, None)
+            if incoming_sid:
+                engine.sessions.pop(incoming_sid, None)
+                base_headers["Mcp-Session-Id"] = incoming_sid
             return Response(status_code=200, headers=base_headers)
 
         if request.method == "GET":
-            accept = request.headers.get("accept", "")
+            if incoming_sid:
+                base_headers["Mcp-Session-Id"] = engine.ensure_session(incoming_sid)
+            accept = request.headers.get("accept", "").lower()
             if "text/event-stream" not in accept and "*/*" not in accept and accept != "":
                 return JSONResponse(
                     {"error": "GET /mcp requires Accept: text/event-stream"},
@@ -633,7 +968,8 @@ def create_app(
                 yield ": connected\n\n"
                 try:
                     while True:
-                        await asyncio.sleep(20)
+                        interval = float(getattr(app.state, "keepalive_interval", 15.0))
+                        await asyncio.sleep(interval)
                         yield ": keepalive\n\n"
                 except asyncio.CancelledError:
                     return
@@ -647,6 +983,8 @@ def create_app(
         try:
             payload = await request.json()
         except Exception:
+            if incoming_sid:
+                base_headers["Mcp-Session-Id"] = engine.ensure_session(incoming_sid)
             return JSONResponse(
                 {
                     "jsonrpc": "2.0",
@@ -657,41 +995,102 @@ def create_app(
                 headers=base_headers,
             )
 
-        if isinstance(payload, list):
-            responses = []
-            for item in payload:
-                if isinstance(item, dict):
-                    resp = await engine.handle_rpc_message(item)
-                    if resp is not None:
-                        responses.append(resp)
-            if not responses:
-                return Response(status_code=202, headers=base_headers)
-            return JSONResponse(responses, headers=base_headers)
+        if incoming_sid:
+            base_headers["Mcp-Session-Id"] = engine.ensure_session(incoming_sid)
+        elif _is_initialize_payload(payload):
+            base_headers["Mcp-Session-Id"] = engine.ensure_session(None)
 
-        if isinstance(payload, dict):
-            resp = await engine.handle_rpc_message(payload)
-            if resp is None:
-                return Response(status_code=202, headers=base_headers)
+        if isinstance(payload, list) and len(payload) == 0:
+            return JSONResponse(
+                {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32600, "message": "Invalid Request: empty batch"},
+                },
+                status_code=400,
+                headers=base_headers,
+            )
 
-            accept = request.headers.get("accept", "application/json")
-            if "text/event-stream" in accept and "application/json" not in accept:
-                body = f"event: message\ndata: {json.dumps(resp, ensure_ascii=False)}\n\n"
-                return Response(
-                    content=body,
-                    media_type="text/event-stream",
-                    headers={**base_headers, "X-Accel-Buffering": "no"},
-                )
-            return JSONResponse(resp, headers=base_headers)
+        if not isinstance(payload, (dict, list)):
+            return JSONResponse(
+                {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32600, "message": "Invalid JSON-RPC request"},
+                },
+                status_code=400,
+                headers=base_headers,
+            )
 
-        return JSONResponse(
-            {
-                "jsonrpc": "2.0",
-                "id": None,
-                "error": {"code": -32600, "message": "Invalid JSON-RPC request"},
-            },
-            status_code=400,
-            headers=base_headers,
-        )
+        accept = request.headers.get("accept", "application/json").lower()
+
+        if "text/event-stream" in accept and _contains_tool_call(payload):
+            progress_token = None
+            if isinstance(payload, dict) and payload.get("method") == "tools/call":
+                params = payload.get("params")
+                if isinstance(params, dict):
+                    meta = params.get("_meta")
+                    if isinstance(meta, dict) and meta.get("progressToken") is not None:
+                        progress_token = meta.get("progressToken")
+
+            async def _stream_rpc():
+                yield ": connected\n\n"
+                task = asyncio.create_task(_execute_rpc_payload(payload))
+                progress_step = 0
+                try:
+                    while True:
+                        interval = float(getattr(app.state, "keepalive_interval", 15.0))
+                        done, _ = await asyncio.wait({task}, timeout=interval)
+                        if task in done:
+                            break
+                        yield ": keepalive\n\n"
+                        if progress_token is not None:
+                            progress_step += 1
+                            notif = {
+                                "jsonrpc": "2.0",
+                                "method": "notifications/progress",
+                                "params": {
+                                    "progressToken": progress_token,
+                                    "progress": progress_step,
+                                    "message": "Tool still running on Colab...",
+                                },
+                            }
+                            yield f"event: message\ndata: {json.dumps(notif, ensure_ascii=False)}\n\n"
+                    result_payload = task.result()
+                    if result_payload is not None and result_payload != []:
+                        yield (
+                            "event: message\n"
+                            f"data: {json.dumps(result_payload, ensure_ascii=False)}\n\n"
+                        )
+                except asyncio.CancelledError:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                    raise
+                finally:
+                    if not task.done():
+                        task.cancel()
+
+            return StreamingResponse(
+                _stream_rpc(),
+                media_type="text/event-stream",
+                headers={**base_headers, "X-Accel-Buffering": "no"},
+            )
+
+        result_payload = await _execute_rpc_payload(payload)
+        if result_payload is None or result_payload == []:
+            return Response(status_code=202, headers=base_headers)
+
+        if "text/event-stream" in accept and "application/json" not in accept:
+            body = f"event: message\ndata: {json.dumps(result_payload, ensure_ascii=False)}\n\n"
+            return Response(
+                content=body,
+                media_type="text/event-stream",
+                headers={**base_headers, "X-Accel-Buffering": "no"},
+            )
+        return JSONResponse(result_payload, headers=base_headers)
 
     async def legacy_sse_endpoint(request: Request) -> Response:
         if not _is_authorized(request):
@@ -711,8 +1110,9 @@ def create_app(
             yield f"event: endpoint\ndata: {msg_endpoint}\n\n"
             try:
                 while True:
+                    interval = float(getattr(app.state, "keepalive_interval", 15.0))
                     try:
-                        data = await asyncio.wait_for(queue.get(), timeout=20)
+                        data = await asyncio.wait_for(queue.get(), timeout=interval)
                         if data is None:
                             break
                         yield f"event: message\ndata: {data}\n\n"
@@ -736,15 +1136,45 @@ def create_app(
         if not queue:
             return JSONResponse({"error": "Unknown SSE session_id"}, status_code=404)
 
-        payload = await request.json()
-        if isinstance(payload, dict):
-            resp = await engine.handle_rpc_message(payload)
-            if resp is not None:
-                await queue.put(json.dumps(resp, ensure_ascii=False))
+        try:
+            payload = await request.json()
+        except Exception:
+            return JSONResponse(
+                {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32700, "message": "Parse error: invalid JSON"},
+                },
+                status_code=400,
+            )
+
+        if isinstance(payload, list) and len(payload) == 0:
+            return JSONResponse(
+                {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32600, "message": "Invalid Request: empty batch"},
+                },
+                status_code=400,
+            )
+
+        if not isinstance(payload, (dict, list)):
+            return JSONResponse(
+                {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32600, "message": "Invalid JSON-RPC request"},
+                },
+                status_code=400,
+            )
+
+        result_payload = await _execute_rpc_payload(payload)
+        if result_payload is not None and result_payload != []:
+            await queue.put(json.dumps(result_payload, ensure_ascii=False))
         return Response(status_code=202)
 
     async def oauth_protected_resource(request: Request) -> JSONResponse:
-        base = _get_external_base_url(request, public_url)
+        base = _get_external_base_url(request, app.state.public_url)
         return JSONResponse(
             {
                 "resource": f"{base}/mcp",
@@ -754,7 +1184,7 @@ def create_app(
         )
 
     async def oauth_authorization_server(request: Request) -> JSONResponse:
-        base = _get_external_base_url(request, public_url)
+        base = _get_external_base_url(request, app.state.public_url)
         return JSONResponse(
             {
                 "issuer": base,
@@ -763,26 +1193,66 @@ def create_app(
                 "registration_endpoint": f"{base}/oauth/register",
                 "response_types_supported": ["code"],
                 "grant_types_supported": ["authorization_code", "refresh_token"],
-                "token_endpoint_auth_methods_supported": ["none", "client_secret_post"],
+                "token_endpoint_auth_methods_supported": [
+                    "none",
+                    "client_secret_post",
+                    "client_secret_basic",
+                ],
                 "code_challenge_methods_supported": ["S256"],
-                "client_id_metadata_document_supported": True,
+                "client_id_metadata_document_supported": False,
             }
         )
 
     async def oauth_register(request: Request) -> JSONResponse:
-        body = await request.json()
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid_client_metadata"}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "invalid_client_metadata"}, status_code=400)
+
+        redirect_uris = body.get("redirect_uris")
+        if (
+            not isinstance(redirect_uris, list)
+            or not redirect_uris
+            or not all(_is_valid_redirect_uri(uri) for uri in redirect_uris)
+        ):
+            return JSONResponse({"error": "invalid_redirect_uri"}, status_code=400)
+
         client_id = f"client_{secrets.token_hex(8)}"
-        redirect_uris = body.get("redirect_uris") or []
         record = {
             "client_id": client_id,
-            "client_name": body.get("client_name", "MCP Client"),
-            "redirect_uris": redirect_uris,
+            "client_name": str(body.get("client_name", "MCP Client")),
+            "redirect_uris": list(redirect_uris),
             "grant_types": body.get("grant_types", ["authorization_code", "refresh_token"]),
             "response_types": body.get("response_types", ["code"]),
             "token_endpoint_auth_method": body.get("token_endpoint_auth_method", "none"),
         }
+        while len(oauth.clients) >= MAX_OAUTH_CLIENTS:
+            oldest_cid = next(iter(oauth.clients))
+            oauth.clients.pop(oldest_cid, None)
         oauth.clients[client_id] = record
         return JSONResponse(record, status_code=201)
+
+    def _validate_authorize_params(
+        client_id: str,
+        redirect_uri: str,
+        code_challenge: str,
+        code_challenge_method: str,
+        response_type: str = "",
+    ) -> Optional[str]:
+        if response_type and response_type != "code":
+            return "Unsupported response_type; only 'code' is supported."
+        client = oauth.clients.get(client_id)
+        if not client:
+            return "Unknown or unregistered client_id."
+        if redirect_uri not in client["redirect_uris"]:
+            return "Invalid or unregistered redirect_uri."
+        if not code_challenge:
+            return "Missing required PKCE code_challenge."
+        if code_challenge_method != "S256":
+            return "Unsupported code_challenge_method; S256 is required."
+        return None
 
     async def oauth_authorize(request: Request) -> Response:
         if request.method == "GET":
@@ -791,97 +1261,153 @@ def create_app(
             redirect_uri = q.get("redirect_uri", "")
             state = q.get("state", "")
             code_challenge = q.get("code_challenge", "")
-            code_challenge_method = q.get("code_challenge_method", "S256")
-            page = f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Authorize Colab Cloud MCP</title>
-  <style>
-    body {{ font-family: system-ui, -apple-system, sans-serif; background: #0f172a; color: #f8fafc; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 16px; }}
-    .card {{ background: #1e293b; border: 1px solid #334155; border-radius: 12px; max-width: 420px; width: 100%; padding: 24px; box-shadow: 0 10px 30px rgba(0,0,0,0.4); }}
-    h1 {{ font-size: 1.25rem; margin: 0 0 8px; }}
-    p {{ color: #94a3b8; font-size: 0.9rem; line-height: 1.5; margin: 0 0 16px; }}
-    input[type="password"] {{ width: 100%; box-sizing: border-box; padding: 10px 12px; border-radius: 8px; border: 1px solid #475569; background: #0f172a; color: #f8fafc; margin-bottom: 16px; font-family: monospace; }}
-    button {{ width: 100%; padding: 10px 16px; border: none; border-radius: 8px; background: #3b82f6; color: white; font-weight: 600; cursor: pointer; }}
-    button:hover {{ background: #2563eb; }}
-  </style>
-</head>
-<body>
-  <form class="card" method="post" action="/oauth/authorize">
-    <h1>Connect to Google Colab</h1>
-    <p>Enter the <code>MCP_TOKEN</code> printed in your Colab notebook to grant MCP access.</p>
-    <input type="hidden" name="client_id" value="{html.escape(client_id)}" />
-    <input type="hidden" name="redirect_uri" value="{html.escape(redirect_uri)}" />
-    <input type="hidden" name="state" value="{html.escape(state)}" />
-    <input type="hidden" name="code_challenge" value="{html.escape(code_challenge)}" />
-    <input type="hidden" name="code_challenge_method" value="{html.escape(code_challenge_method)}" />
-    <input type="password" name="mcp_token" placeholder="Paste MCP_TOKEN..." required autofocus />
-    <button type="submit">Authorize Connection</button>
-  </form>
-</body>
-</html>"""
-            return HTMLResponse(page)
+            code_challenge_method = q.get("code_challenge_method", "")
+            response_type = q.get("response_type", "")
+            err = _validate_authorize_params(
+                client_id,
+                redirect_uri,
+                code_challenge,
+                code_challenge_method,
+                response_type=response_type,
+            )
+            if err:
+                return _render_authorize_error(err)
+            return HTMLResponse(
+                _render_authorize_form(
+                    client_id=client_id,
+                    redirect_uri=redirect_uri,
+                    state=state,
+                    code_challenge=code_challenge,
+                    code_challenge_method=code_challenge_method,
+                )
+            )
 
-        form = await request.form()
-        submitted = str(form.get("mcp_token", "")).strip()
-        if not hmac.compare_digest(submitted, token):
-            return HTMLResponse("Invalid MCP_TOKEN.", status_code=403)
+        form = await _parse_urlencoded_form(request)
+        client_id = form.get("client_id", "")
+        redirect_uri = form.get("redirect_uri", "")
+        state = form.get("state", "")
+        code_challenge = form.get("code_challenge", "")
+        code_challenge_method = form.get("code_challenge_method", "")
 
-        redirect_uri = str(form.get("redirect_uri", ""))
-        state = str(form.get("state", ""))
+        err = _validate_authorize_params(
+            client_id, redirect_uri, code_challenge, code_challenge_method
+        )
+        if err:
+            return _render_authorize_error(err)
+
+        submitted = form.get("mcp_token", "").strip()
+        if not _consteq(submitted, token):
+            return HTMLResponse(
+                _render_authorize_form(
+                    client_id=client_id,
+                    redirect_uri=redirect_uri,
+                    state=state,
+                    code_challenge=code_challenge,
+                    code_challenge_method=code_challenge_method,
+                    error_message="Invalid MCP_TOKEN, please try again.",
+                ),
+                status_code=403,
+            )
+
+        now = time.time()
+        expired = [c for c, rec in oauth.auth_codes.items() if rec["expires_at"] < now]
+        for c in expired:
+            oauth.auth_codes.pop(c, None)
+        while len(oauth.auth_codes) >= MAX_OAUTH_AUTH_CODES:
+            oldest_code = next(iter(oauth.auth_codes))
+            oauth.auth_codes.pop(oldest_code, None)
+
         code = secrets.token_urlsafe(24)
         oauth.auth_codes[code] = {
-            "client_id": str(form.get("client_id", "")),
+            "client_id": client_id,
             "redirect_uri": redirect_uri,
-            "code_challenge": str(form.get("code_challenge", "")),
-            "code_challenge_method": str(form.get("code_challenge_method", "S256")),
-            "expires_at": time.time() + 300,
+            "code_challenge": code_challenge,
+            "code_challenge_method": code_challenge_method,
+            "expires_at": now + 300,
         }
         sep = "&" if "?" in redirect_uri else "?"
-        location = f"{redirect_uri}{sep}code={urllib.parse.quote(code)}"
+        location = f"{redirect_uri}{sep}code={urllib.parse.quote(code, safe='')}"
         if state:
-            location += f"&state={urllib.parse.quote(state)}"
+            location += f"&state={urllib.parse.quote(state, safe='')}"
         return Response(status_code=302, headers={"Location": location})
 
     async def oauth_token(request: Request) -> JSONResponse:
-        ctype = request.headers.get("content-type", "")
+        ctype = request.headers.get("content-type", "").lower()
         if "application/json" in ctype:
-            data = await request.json()
+            try:
+                raw_data = await request.json()
+            except Exception:
+                return JSONResponse({"error": "invalid_request"}, status_code=400)
+            if not isinstance(raw_data, dict):
+                return JSONResponse({"error": "invalid_request"}, status_code=400)
+            data: Dict[str, Any] = dict(raw_data)
         else:
-            form = await request.form()
-            data = dict(form)
+            data = await _parse_urlencoded_form(request)
+
+        auth_header = request.headers.get("authorization", "")
+        if auth_header.lower().startswith("basic "):
+            try:
+                decoded = base64.b64decode(auth_header[6:].strip(), validate=True).decode("utf-8")
+            except Exception:
+                return JSONResponse({"error": "invalid_client"}, status_code=401)
+            if ":" not in decoded:
+                return JSONResponse({"error": "invalid_client"}, status_code=401)
+            raw_cid, _ = decoded.split(":", 1)
+            basic_cid = urllib.parse.unquote_plus(raw_cid)
+            body_cid = str(data.get("client_id", "") or "")
+            if body_cid and basic_cid and body_cid != basic_cid:
+                return JSONResponse({"error": "invalid_request"}, status_code=400)
+            if basic_cid:
+                data["client_id"] = basic_cid
 
         grant_type = data.get("grant_type")
         if grant_type == "authorization_code":
-            code = str(data.get("code", ""))
+            code = str(data.get("code", "") or "")
             record = oauth.auth_codes.pop(code, None)
             if not record or record["expires_at"] < time.time():
                 return JSONResponse({"error": "invalid_grant"}, status_code=400)
 
-            challenge = record.get("code_challenge")
-            if challenge:
-                verifier = str(data.get("code_verifier", ""))
-                digest = hashlib.sha256(verifier.encode("ascii")).digest()
-                computed = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
-                if not hmac.compare_digest(computed, challenge):
+            req_client_id = str(data.get("client_id", "") or "")
+            if not req_client_id or not _consteq(req_client_id, record["client_id"]):
+                return JSONResponse({"error": "invalid_grant"}, status_code=400)
+
+            if "redirect_uri" in data:
+                if str(data.get("redirect_uri") or "") != record["redirect_uri"]:
                     return JSONResponse({"error": "invalid_grant"}, status_code=400)
 
+            challenge = record.get("code_challenge", "")
+            verifier = str(data.get("code_verifier", "") or "")
+            if (
+                not challenge
+                or record.get("code_challenge_method") != "S256"
+                or not verifier
+            ):
+                return JSONResponse({"error": "invalid_grant"}, status_code=400)
+
+            try:
+                verifier_bytes = verifier.encode("ascii")
+            except UnicodeEncodeError:
+                return JSONResponse({"error": "invalid_grant"}, status_code=400)
+            digest = hashlib.sha256(verifier_bytes).digest()
+            computed = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+            if not _consteq(computed, challenge):
+                return JSONResponse({"error": "invalid_grant"}, status_code=400)
+
             access_token = oauth.issue_signed_token("access", ttl_seconds=86400 * 30)
-            refresh_token = oauth.issue_signed_token("access", ttl_seconds=86400 * 90)
+            refresh_token = oauth.issue_signed_token("refresh", ttl_seconds=86400 * 90)
             return JSONResponse(
                 {
                     "access_token": access_token,
                     "token_type": "Bearer",
                     "expires_in": 86400 * 30,
                     "refresh_token": refresh_token,
-                }
+                },
+                headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
             )
 
         if grant_type == "refresh_token":
-            rt_tok = str(data.get("refresh_token", ""))
-            if not oauth.verify_token(rt_tok):
+            rt_tok = str(data.get("refresh_token", "") or "")
+            if not oauth.verify_token(rt_tok, expected_kind="refresh"):
                 return JSONResponse({"error": "invalid_grant"}, status_code=400)
             access_token = oauth.issue_signed_token("access", ttl_seconds=86400 * 30)
             return JSONResponse(
@@ -890,7 +1416,8 @@ def create_app(
                     "token_type": "Bearer",
                     "expires_in": 86400 * 30,
                     "refresh_token": rt_tok,
-                }
+                },
+                headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
             )
 
         return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
@@ -908,13 +1435,21 @@ def create_app(
         Route("/.well-known/oauth-protected-resource", oauth_protected_resource, methods=["GET"]),
         Route("/.well-known/oauth-protected-resource/mcp", oauth_protected_resource, methods=["GET"]),
         Route("/.well-known/oauth-authorization-server", oauth_authorization_server, methods=["GET"]),
+        Route("/.well-known/openid-configuration", oauth_authorization_server, methods=["GET"]),
         Route("/oauth/register", oauth_register, methods=["POST"]),
         Route("/oauth/authorize", oauth_authorize, methods=["GET", "POST"]),
         Route("/oauth/token", oauth_token, methods=["POST"]),
     ]
 
-    app = Starlette(debug=False, routes=routes)
+    app = Starlette(
+        debug=False,
+        routes=routes,
+        middleware=[Middleware(_CORSMiddleware)],
+    )
     app.state.runtime = rt
     app.state.engine = engine
     app.state.token = token
+    app.state.public_url = public_url
+    app.state.instance_id = instance_id or uuid.uuid4().hex
+    app.state.keepalive_interval = 15.0
     return app
