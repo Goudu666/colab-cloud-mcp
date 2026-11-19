@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.colab_mcp_jobs/
+.pytest_cache/
+.env
