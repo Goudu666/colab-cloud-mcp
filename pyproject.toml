@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "colab-cloud-mcp"
+version = "0.1.0"
+description = "Cloud-to-Colab Remote MCP server over Streamable HTTP for Claude and Google Antigravity"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = [
+    "starlette>=0.25.0",
+    "uvicorn>=0.17.0",
+]
+
+[project.optional-dependencies]
+ngrok = ["pyngrok>=7.0.0"]
+dev = ["httpx>=0.23.0"]
+
+[project.scripts]
+colab-cloud-mcp = "colab_cloud_mcp.tunnel:cli_main"
+
+[tool.setuptools.packages.find]
+include = ["colab_cloud_mcp*"]
